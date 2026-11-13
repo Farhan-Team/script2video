@@ -106,6 +106,8 @@ class Config:
     font_size: int = 0                # 0 = auto
     caption_words: int = 6
     highlight: str = "&H0000D7FF"     # ASS colour (BGR) of the spoken word — gold
+    caption_lang: str = "en"          # captions are always shown in this language ("" = same as voice)
+    look: str = "natural"             # natural | dark (cinematic grade, vignette, fades)
     # audio
     music: Optional[Path] = None      # a file, or None
     auto_music: bool = False          # fetch free background music (Openverse, no key)
@@ -130,6 +132,8 @@ class Scene:
     words: list = field(default_factory=list)      # [start, end, word] from the voice engine
     media: list["Media"] = field(default_factory=list)
     shot_queries: list = field(default_factory=list)  # per-shot search terms
+    caption: str = ""                     # on-screen text (English) when it differs from the voice
+    shot_tags: list = field(default_factory=list)     # [search: a | b | c] -> one per shot
 
 
 @dataclass
@@ -162,6 +166,8 @@ def sha(*parts) -> str:
 # --------------------------------------------------------------------------- script parsing
 
 TAG_RE = re.compile(r"\[(?:search|visual|keywords?|broll|b-roll)\s*:\s*([^\]]+)\]", re.I)
+# [voice: ...] (or [ur: ...], [ar: ...]) = what the narrator says; the paragraph itself is the caption
+VOICE_RE = re.compile(r"\[(?:voice|say|narration|[a-z]{2})\s*:\s*([^\]]+)\]", re.I)
 SENT_RE = re.compile(r"(?<=[.!?؟۔…])[\"')\]]*\s+")
 
 
@@ -173,11 +179,19 @@ def parse_script(text: str, words_per_scene: int) -> list[Scene]:
     for para in re.split(r"\n\s*\n", text):
         tags = TAG_RE.findall(para)
         tag = tags[0].strip() if tags else None
+        shot_tags = [t.strip() for t in tag.split("|") if t.strip()] if tag else []
+        if shot_tags:
+            tag = shot_tags[0]
+        voices = [v for v in VOICE_RE.findall(re.sub(TAG_RE, " ", para))]
         clean = re.sub(r"\[[^\]]*\]", " ", para)           # drop [tags] / [stage directions]
         clean = re.sub(r"^\s*#+\s*", "", clean, flags=re.M)  # markdown headings
         clean = re.sub(r"[*_`>]+", "", clean)                 # markdown emphasis
         clean = re.sub(r"\s+", " ", clean).strip()
         if not clean:
+            continue
+        if voices:   # bilingual paragraph: one scene, voice text + caption text
+            spoken = re.sub(r"\s+", " ", " ".join(voices)).strip()
+            scenes.append(Scene(spoken, tag, caption=clean, shot_tags=shot_tags))
             continue
         sentences = [s.strip() for s in SENT_RE.split(clean) if s.strip()]
         chunks: list[str] = []
@@ -193,8 +207,64 @@ def parse_script(text: str, words_per_scene: int) -> list[Scene]:
                 chunks[-1] += " " + rest                       # don't leave a tiny tail scene
             else:
                 chunks.append(rest)
-        scenes.extend(Scene(c, tag) for c in chunks)
+        scenes.extend(Scene(c, tag, shot_tags=shot_tags) for c in chunks)
     return scenes
+
+
+def voice_lang(voice: str) -> str:
+    return (voice.split("-")[0] or "en").lower()
+
+
+def is_lang(text: str, lang: str) -> bool:
+    """Rough check: Latin-script text counts as English, Arabic-script as ur/ar/fa."""
+    arabic = len(URDU_RE.findall(text))
+    latin = len(re.findall(r"[A-Za-z]", text))
+    if lang in ("ur", "ar", "fa", "ps", "sd"):
+        return arabic > latin
+    if lang == "en":
+        return latin > 0 and arabic == 0 and not re.search(r"[\u0900-\u0DFF\u0400-\u04FF\u4E00-\u9FFF]", text)
+    return False
+
+
+def translate(text: str, target: str, cache: Path, source: str = "auto") -> str:
+    """Free machine translation (Google Translate's public endpoint, no key). Cached on disk."""
+    f = cache / f"tr_{sha(text, source, target)}.txt"
+    if f.exists():
+        return f.read_text("utf-8")
+    last = None
+    for attempt in range(3):
+        try:
+            r = requests.get("https://translate.googleapis.com/translate_a/single",
+                             params={"client": "gtx", "sl": source, "tl": target, "dt": "t", "q": text},
+                             timeout=20)
+            r.raise_for_status()
+            out = "".join(seg[0] for seg in r.json()[0] if seg and seg[0]).strip()
+            if out:
+                f.write_text(out, "utf-8")
+                return out
+        except Exception as e:  # noqa
+            last = e
+        time.sleep(1.5 * (attempt + 1))
+    log(f"  ! Translation failed ({last}); keeping the original text")
+    return text
+
+
+def prepare_languages(scenes: list[Scene], cfg: Config, cache: Path) -> None:
+    """Voice speaks the voice's language; captions always show cfg.caption_lang (English)."""
+    vl, cl = voice_lang(cfg.voice), cfg.caption_lang
+    for s in scenes:
+        if s.caption:                                   # bilingual script: both given
+            if cl and not is_lang(s.caption, cl):
+                s.caption = translate(s.caption, cl, cache)
+            continue
+        original = s.text
+        if vl != "en" and is_lang(original, "en"):       # English script, foreign voice
+            s.text = translate(original, vl, cache, "en")
+            s.caption = original if cl == "en" else ""
+        elif cl and not is_lang(original, cl):          # foreign script -> English captions
+            s.caption = translate(original, cl, cache)
+        if s.caption and s.caption.strip() == s.text.strip():
+            s.caption = ""
 
 
 def _words(text: str) -> list[str]:
@@ -211,7 +281,7 @@ class QueryMaker:
     two-word phrases that appear in the text ("sand dunes", "city skyline")."""
 
     def __init__(self, scenes: list[Scene]):
-        docs = [_words(s.text) for s in scenes]
+        docs = [_words(s.caption or s.text) for s in scenes]
         self.df = Counter()
         for d in docs:
             self.df.update(set(d))
@@ -273,7 +343,8 @@ def split_for_shots(text: str, n: int) -> list[str]:
 def assign_queries(scenes: list[Scene]) -> QueryMaker:
     qm = QueryMaker(scenes)
     for s in scenes:
-        s.queries = qm(s.text, s.tag) + [x for x in qm.fallback() if x not in qm(s.text, s.tag)]
+        base = qm(s.caption or s.text, s.tag)
+        s.queries = base + [x for x in qm.fallback() if x not in base]
     return qm
 
 
@@ -888,16 +959,24 @@ URDU_FALLBACK = str.maketrans({"\u06C1": "\u0647", "\u06C2": "\u06C0", "\u06C3":
 def write_ass(scene: Scene, cfg: Config, path: Path) -> None:
     W, H = cfg.width, cfg.height
     vertical = H > W
+    mode = cfg.captions
+    if scene.caption:     # captions in another language than the voice: no per-word timing exists
+        scene = Scene(scene.caption, scene.tag, scene.queries, scene.audio, scene.speech_dur, [])
+        if mode == "words":
+            mode = "phrases"
     font, factor = caption_font(scene.text, cfg)
     if font == "DejaVu Sans":
         scene = Scene(scene.text.translate(URDU_FALLBACK), scene.tag, scene.queries, scene.audio,
                       scene.speech_dur, [[a, b, w.translate(URDU_FALLBACK)] for a, b, w in scene.words])
     size = cfg.font_size or round((W * 0.052 if vertical else H * 0.056) * factor)
-    if cfg.caption_style == "box":
+    style = "outline" if cfg.look == "dark" else cfg.caption_style
+    if cfg.look == "dark":
+        size = round(size * 0.9)
+    if style == "box":
         border, outline, shadow, back = 3, max(8, size // 5), 0, "&H64000000"
         outc = "&H8C000000"
     else:
-        border, outline, shadow, back = 1, max(3, size // 14), 2, "&H96000000"
+        border, outline, shadow, back = 1, max(2, size // 18), 3, "&H64000000"
         outc = "&H00000000"
     margin_v = round(H * (0.22 if vertical else 0.08))
     margin_lr = round(W * 0.08)
@@ -915,17 +994,18 @@ def write_ass(scene: Scene, cfg: Config, path: Path) -> None:
         f"1,0,0,2,{margin_lr},{margin_lr},{margin_v},1",
         "", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
-    if cfg.captions == "words":
+    if mode == "words":
         lines += karaoke_events(scene, cfg)
         path.write_text("\n".join(lines) + "\n", "utf-8")
         return
-    chunks = caption_chunks(scene.text, cfg.captions, cfg.caption_words)
+    chunks = caption_chunks(scene.text, mode, cfg.caption_words)
     weights = [len(c) + 6 for c in chunks]          # +6 ≈ the small pause at each break
     total_w = sum(weights) or 1
     t = 0.0
     for c, w in zip(chunks, weights):
         d = scene.speech_dur * w / total_w
-        lines.append(f"Dialogue: 0,{ass_time(t)},{ass_time(t + d)},Default,,0,0,0,,{ass_escape(c)}")
+        fx = "{\\fad(150,150)}" if cfg.look == "dark" else ""
+        lines.append(f"Dialogue: 0,{ass_time(t)},{ass_time(t + d)},Default,,0,0,0,,{fx}{ass_escape(c)}")
         t += d
     path.write_text("\n".join(lines) + "\n", "utf-8")
 
@@ -1009,7 +1089,7 @@ def render_scene(idx: int, scene: Scene, cfg: Config, sdir: Path) -> Path:
     total = scene.speech_dur + cfg.pause
     sig = sha(scene.text, scene.audio, [str(m.path or m.key) for m in scene.media], W, H, FPS, cfg.captions,
               cfg.caption_style, cfg.font, cfg.font_size, cfg.caption_words, cfg.pause, cfg.crf, cfg.preset,
-              video_encoder_args(cfg), cfg.highlight, json.dumps(scene.words))
+              video_encoder_args(cfg), cfg.highlight, json.dumps(scene.words), scene.caption, cfg.look)
     out = sdir / f"scene_{idx:04d}_{sig}.mp4"
     if out.exists() and out.stat().st_size > 0:
         return out
@@ -1046,7 +1126,13 @@ def render_scene(idx: int, scene: Scene, cfg: Config, sdir: Path) -> Path:
             chains.append(f"[{k}:v]trim=duration={seg:.3f},setpts=PTS-STARTPTS,setsar=1,format=yuv420p[v{k}]")
     cmd += ["-i", str(scene.audio)]
     vlabels = "".join(f"[v{k}]" for k in range(n))
-    chains.append(f"{vlabels}concat=n={n}:v=1:a=0[vc]")
+    grade = ""
+    if cfg.look == "dark":   # one consistent cinematic look over every shot, fades between scenes
+        fd = min(0.45, total / 6)
+        grade = (",eq=contrast=1.15:brightness=-0.06:saturation=0.5:gamma=0.92,"
+                 "colorbalance=rs=-0.03:bs=0.05:rm=-0.02:bm=0.03:rh=0.03:bh=-0.02,"
+                 f"vignette=angle=PI/4.2,fade=t=in:st=0:d={fd:.2f},fade=t=out:st={total - fd:.3f}:d={fd:.2f}")
+    chains.append(f"{vlabels}concat=n={n}:v=1:a=0{grade}[vc]")
     if cfg.captions != "none":
         ass = sdir / f"scene_{idx:04d}_{sig}.ass"
         write_ass(scene, cfg, ass)
@@ -1082,6 +1168,7 @@ def build_video(cfg: Config) -> Path:
     scenes = parse_script(cfg.script_text, cfg.words_per_scene)
     if not scenes:
         raise ValueError("The script is empty.")
+    prepare_languages(scenes, cfg, cache)
     qm = assign_queries(scenes)
     t_start = time.time()
     stage = {"t": t_start}
@@ -1114,7 +1201,11 @@ def build_video(cfg: Config) -> Path:
     for i, s in enumerate(scenes):
         total = s.speech_dur + cfg.pause
         n = max(1, round(total / cfg.clip_seconds))
-        s.shot_queries = [qm(part) for part in split_for_shots(s.text, n)]
+        if s.shot_tags and len(s.shot_tags) > 1:
+            n = max(n, len(s.shot_tags))
+            s.shot_queries = [[s.shot_tags[k % len(s.shot_tags)]] for k in range(n)]
+        else:
+            s.shot_queries = [qm(part) for part in split_for_shots(s.caption or s.text, n)]
         s.media = finder.pick(s, n, total / n)
         cfg.progress(0.25 + 0.10 * (i + 1) / len(scenes), f"Searching footage {i + 1}/{len(scenes)}")
     all_media = [m for s in scenes for m in s.media]
@@ -1221,6 +1312,9 @@ def main() -> None:
                     help="words = highlight each word as it is spoken (default)")
     ap.add_argument("--caption-style", choices=["box", "outline"], default="box")
     ap.add_argument("--caption-words", type=int, default=6, help="max words on screen at once")
+    ap.add_argument("--caption-lang", default="en", help="captions always in this language (default en; '' = voice's)")
+    ap.add_argument("--look", choices=["natural", "dark"], default="natural",
+                    help="dark = moody cinematic grade + vignette + fades (true crime, horror, mystery)")
     ap.add_argument("--font", default="Arial", help="caption font name installed on your system")
     ap.add_argument("--font-size", type=int, default=0)
     ap.add_argument("--music", help="background music file, or 'auto' for free music (loops, ducks under voice)")
@@ -1253,6 +1347,7 @@ def main() -> None:
         pexels_key=os.getenv("PEXELS_API_KEY", ""), pixabay_key=os.getenv("PIXABAY_API_KEY", ""),
         unsplash_key=os.getenv("UNSPLASH_ACCESS_KEY", ""),
         captions=a.captions, caption_style=a.caption_style, caption_words=a.caption_words,
+        caption_lang=a.caption_lang, look=a.look,
         font=a.font, font_size=a.font_size,
         music=Path(a.music) if a.music and a.music.lower() != "auto" else None,
         auto_music=bool(a.music and a.music.lower() == "auto"), music_mood=a.music_mood,
