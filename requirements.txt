@@ -1,0 +1,4 @@
+requests>=2.31
+edge-tts>=7.0
+gradio>=4.40        # only needed for the web UI (app.py)
+# pyttsx3           # optional: offline voice (--tts system)
