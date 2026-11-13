@@ -116,6 +116,7 @@ class Config:
     preset: str = "veryfast"
     encoder: str = "auto"             # auto (GPU if available) | gpu | cpu
     workers: int = 0                  # 0 = one per CPU core
+    partial_downloads: bool = True    # fetch only the needed seconds of long remote clips
     progress: Callable[[float, str], None] = field(default=lambda f, m: None, repr=False)
 
 
@@ -142,6 +143,8 @@ class Media:
     credit: str = ""
     page: str = ""
     ping: str = ""             # Unsplash download-tracking endpoint
+    need: float = 0.0          # seconds of this clip the shot needs
+    trimmed: bool = False      # downloaded already cut to the needed part
 
 
 def log(msg: str) -> None:
@@ -399,13 +402,14 @@ class StockFinder:
         self.http = requests.Session()
         # Wikimedia requires a descriptive User-Agent with a contact URL
         self.http.headers["User-Agent"] = "script2video/1.1 (https://github.com/Farhan-Team/script2video)"
-        self.wiki_gate = threading.Semaphore(1)   # Wikimedia rate-limits parallel downloads
+        self.wiki_gate = threading.Semaphore(2)   # Wikimedia rate-limits parallel downloads
         self.local: list[Path] = []
         if cfg.media_dir:
             self.local = sorted(p for p in Path(cfg.media_dir).rglob("*")
                                 if p.suffix.lower() in VIDEO_EXT | IMAGE_EXT)
         self.warned: set[str] = set()
         self.down: set[str] = set()
+        self.fails: Counter = Counter()
 
     # ---- provider searches (results cached on disk so re-runs cost no API calls)
     def _cached_get(self, provider: str, url: str, params: dict, headers: dict) -> Optional[dict]:
@@ -427,12 +431,16 @@ class StockFinder:
                     return None
                 r.raise_for_status()
                 data = r.json()
+                self.fails[provider] = 0
                 f.write_text(json.dumps(data), "utf-8")
                 return data
             except requests.RequestException as e:
                 if attempt == 2:
-                    self.down.add(provider)
-                    log(f"  ! {provider} unreachable ({type(e).__name__}) — skipping it for this run")
+                    # a busy server (e.g. 504) can recover: only give up after repeated failures
+                    self.fails[provider] += 1
+                    if self.fails[provider] >= 3 or isinstance(e, (requests.ConnectionError, requests.exceptions.ProxyError)):
+                        self.down.add(provider)
+                        log(f"  ! {provider} unreachable ({type(e).__name__}) — skipping it for this run")
                 time.sleep(1)
         return None
 
@@ -535,7 +543,7 @@ class StockFinder:
             info = (p.get("videoinfo") or [{}])[0]
             dur = float(info.get("duration") or 0)
             title = re.sub(r"^File:|\.[a-z0-9]+$", "", p.get("title", ""), flags=re.I).replace("_", " ")
-            if (dur and dur < 3) or dur > 1200 or JUNK_RE.search(title):   # long = usually a talk/film
+            if (dur and dur < 3) or dur > 900 or JUNK_RE.search(title):    # long = usually a talk/film
                 continue
             w, h = int(info.get("width") or 0), int(info.get("height") or 0)
             if w and h and ((h > w) != portrait) and abs(w - h) > 0.1 * max(w, h):
@@ -560,7 +568,7 @@ class StockFinder:
         d = self._cached_get("openverse", "https://api.openverse.org/v1/images/",
                              {"q": q, "page_size": 20, "category": "photograph",
                               "aspect_ratio": "tall" if self.cfg.height > self.cfg.width else "wide",
-                              "size": "large", "mature": "false"}, {})
+                              "mature": "false"}, {})
         out = []
         for r in (d or {}).get("results", []):
             if not r.get("url") or JUNK_RE.search(r.get("title") or ""):
@@ -639,13 +647,53 @@ class StockFinder:
                 got = self._local_media(random.Random(sha(scene.text, k)).choice(fresh))
             if got is None:
                 got = Media("color", "none", f"color{k}")
+            got.need = seg
             self.used.add(got.key)
             chosen.append(got)
         return chosen
 
+    def _fetch_segment(self, m: Media) -> bool:
+        """Download only the part of a long remote video that the shot uses (HTTP range
+        requests via FFmpeg) instead of the whole file — e.g. 1 MB instead of 20 MB."""
+        lead = 1.0 if m.source in ("pexels", "pixabay") else max(1.5, 0.2 * m.duration)
+        start = max(0.0, min(lead, m.duration - m.need - 0.5))
+        dest = self.cache / f"{m.source}_{sha(m.url, round(start, 1), round(m.need, 1))}.mkv"
+        if not (dest.exists() and dest.stat().st_size > 0):
+            tmp = dest.with_name(dest.stem + ".part.mkv")
+            gate = self.wiki_gate if "wikimedia.org" in m.url else None
+            for attempt in range(4):
+                if gate:
+                    gate.acquire()
+                try:
+                    p = subprocess.run([ffmpeg_bin(), "-y", "-hide_banner", "-loglevel", "error",
+                                        "-user_agent", self.http.headers["User-Agent"],
+                                        "-ss", f"{start:.2f}", "-i", m.url, "-t", f"{m.need + 1.0:.2f}",
+                                        "-map", "0:v:0", "-c", "copy", str(tmp)],
+                                       capture_output=True, text=True, timeout=180)
+                except subprocess.TimeoutExpired:
+                    p = None
+                finally:
+                    if gate:
+                        gate.release()
+                if p is not None and p.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+                    tmp.replace(dest)
+                    break
+                err = (p.stderr if p is not None else "timeout") or ""
+                time.sleep(4 * (attempt + 1) if "429" in err else 1)
+            else:
+                return False
+        d = probe_duration(dest)
+        if d < min(1.0, m.need * 0.5):
+            return False
+        m.path, m.duration, m.trimmed = dest.resolve(), d, True
+        return True
+
     def download(self, m: Media) -> None:
         if m.path or m.kind == "color":
             return
+        if m.kind == "video" and m.need and m.duration > m.need + 8 and self.cfg.partial_downloads:
+            if self._fetch_segment(m):
+                return
         ext = {"video": ".mp4", "image": ".jpg"}.get(m.kind) or (Path(m.url.split("?")[0]).suffix or ".mp3")
         dest = self.cache / f"{m.source}_{sha(m.url)}{ext}"
         if not (dest.exists() and dest.stat().st_size > 0):
@@ -878,7 +926,7 @@ def render_scene(idx: int, scene: Scene, cfg: Config, sdir: Path) -> Path:
         if m.kind == "video":
             loop = ["-stream_loop", "-1"] if m.duration and m.duration < seg + 0.2 else []
             start = 0.0
-            if m.duration > seg + 2:
+            if m.duration > seg + 2 and not m.trimmed:
                 # stock clips: skip the often-static first second; Commons/archive clips often open
                 # with a title card, so start ~20% in (different offsets keep reused clips fresh)
                 lead = 1.0 if m.source in ("pexels", "pixabay", "local") else max(1.5, 0.2 * m.duration)
