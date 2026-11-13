@@ -804,7 +804,7 @@ def caption_chunks(text: str, mode: str, max_words: int) -> list[str]:
     words, chunks, buf = text.split(), [], []
     for w in words:
         buf.append(w)
-        end_punct = w[-1:] in ".!?,;:؟۔…" or w.endswith(("\"", "'"))
+        end_punct = w[-1:] in ".!?,;:؟۔…،" or w.endswith(("\"", "'"))
         if len(buf) >= max_words or (end_punct and len(buf) >= 3):
             chunks.append(" ".join(buf))
             buf = []
@@ -816,10 +816,27 @@ def caption_chunks(text: str, mode: str, max_words: int) -> list[str]:
     return chunks
 
 
+URDU_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]")
+
+
+def caption_font(text: str, cfg: Config) -> tuple[str, float]:
+    """Urdu/Arabic-script text gets a Nastaliq font (if installed); returns (font, size factor)."""
+    if URDU_RE.search(text) and cfg.font == "Arial":
+        try:
+            out = subprocess.run(["fc-list", ":", "family"], capture_output=True, text=True).stdout
+        except OSError:
+            out = ""
+        for fam in ("Noto Nastaliq Urdu", "Jameel Noori Nastaleeq", "Noto Naskh Arabic", "DejaVu Sans"):
+            if fam in out:
+                return fam, (0.85 if "Nastaliq" in fam or "Nastaleeq" in fam else 1.0)
+    return cfg.font, 1.0
+
+
 def write_ass(scene: Scene, cfg: Config, path: Path) -> None:
     W, H = cfg.width, cfg.height
     vertical = H > W
-    size = cfg.font_size or (round(W * 0.052) if vertical else round(H * 0.056))
+    font, factor = caption_font(scene.text, cfg)
+    size = cfg.font_size or round((W * 0.052 if vertical else H * 0.056) * factor)
     if cfg.caption_style == "box":
         border, outline, shadow, back = 3, max(8, size // 5), 0, "&H64000000"
         outc = "&H8C000000"
@@ -835,10 +852,10 @@ def write_ass(scene: Scene, cfg: Config, path: Path) -> None:
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, "
         "Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding",
-        f"Style: Default,{cfg.font},{size},&H00FFFFFF,&H000000FF,{outc},{back},-1,0,0,0,100,100,0,0,"
+        f"Style: Default,{font},{size},&H00FFFFFF,&H000000FF,{outc},{back},-1,0,0,0,100,100,0,0,"
         f"{border},{outline},{shadow},2,{margin_lr},{margin_lr},{margin_v},1",
         # same layout without a box: drawn on top of the boxed line for word highlighting
-        f"Style: Hi,{cfg.font},{size},&H00FFFFFF,&H000000FF,&H00000000,&HFF000000,-1,0,0,0,100,100,0,0,"
+        f"Style: Hi,{font},{size},&H00FFFFFF,&H000000FF,&H00000000,&HFF000000,-1,0,0,0,100,100,0,0,"
         f"1,0,0,2,{margin_lr},{margin_lr},{margin_v},1",
         "", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
@@ -864,7 +881,7 @@ def karaoke_events(scene: Scene, cfg: Config) -> list[str]:
     groups, buf = [], []
     for w in words:
         buf.append(w)
-        if len(buf) >= cfg.caption_words or (w[2][-1:] in ".!?,;:؟۔…" and len(buf) >= 3):
+        if len(buf) >= cfg.caption_words or (w[2][-1:] in ".!?,;:؟۔…،" and len(buf) >= 3):
             groups.append(buf)
             buf = []
     if buf:
@@ -874,12 +891,17 @@ def karaoke_events(scene: Scene, cfg: Config) -> list[str]:
             groups.append(buf)
     hl = cfg.highlight
     boxed = cfg.caption_style == "box"
+    rtl = bool(URDU_RE.search(scene.text))   # colour tags break right-to-left shaping: phrase-only
+    if rtl:
+        boxed = True
     events = []
     for gi, g in enumerate(groups):
         g_end = groups[gi + 1][0][0] if gi + 1 < len(groups) else max(g[-1][1], scene.speech_dur)
         if boxed:   # one continuous box per phrase (colour changes would otherwise split the box)
             plain = " ".join(ass_escape(t) for _, _, t in g)
             events.append(f"Dialogue: 0,{ass_time(g[0][0])},{ass_time(g_end)},Default,,0,0,0,,{plain}")
+        if rtl:
+            continue
         for i, (st, en, _) in enumerate(g):
             start = g[0][0] if i == 0 else st
             end = g[i + 1][0] if i + 1 < len(g) else g_end
