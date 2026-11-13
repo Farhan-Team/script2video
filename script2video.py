@@ -418,9 +418,9 @@ class StockFinder:
             return json.loads(f.read_text("utf-8"))
         if provider in self.down:
             return None
-        for attempt in range(3):
+        for attempt in range(2):
             try:
-                r = self.http.get(url, params=params, headers=headers, timeout=20)
+                r = self.http.get(url, params=params, headers=headers, timeout=10)
                 if r.status_code == 429:
                     time.sleep(5 * (attempt + 1))
                     continue
@@ -435,10 +435,10 @@ class StockFinder:
                 f.write_text(json.dumps(data), "utf-8")
                 return data
             except requests.RequestException as e:
-                if attempt == 2:
-                    # a busy server (e.g. 504) can recover: only give up after repeated failures
+                if attempt == 1:
+                    # a busy server (e.g. 504) can recover: give up after two failed searches
                     self.fails[provider] += 1
-                    if self.fails[provider] >= 3 or isinstance(e, (requests.ConnectionError, requests.exceptions.ProxyError)):
+                    if self.fails[provider] >= 2 or isinstance(e, (requests.ConnectionError, requests.exceptions.ProxyError)):
                         self.down.add(provider)
                         log(f"  ! {provider} unreachable ({type(e).__name__}) — skipping it for this run")
                 time.sleep(1)
