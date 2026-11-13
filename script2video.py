@@ -530,7 +530,11 @@ class StockFinder:
         return out
 
     # ---- keyless sources (work with no API key at all)
-    def commons_videos(self, q: str) -> list[Media]:
+    def commons_videos_relaxed(self, q: str) -> list[Media]:
+        """Last resort before a plain background: allow 360p+ clips."""
+        return self.commons_videos(q, min_side=360)
+
+    def commons_videos(self, q: str, min_side: int = 0) -> list[Media]:
         """Wikimedia Commons free-licensed videos, using its 720p/1080p transcodes."""
         d = self._cached_get("commons_v", "https://commons.wikimedia.org/w/api.php",
                              {"action": "query", "format": "json", "generator": "search", "gsrnamespace": 6,
@@ -548,20 +552,52 @@ class StockFinder:
             w, h = int(info.get("width") or 0), int(info.get("height") or 0)
             if w and h and ((h > w) != portrait) and abs(w - h) > 0.1 * max(w, h):
                 continue                                                      # wrong orientation
-            if min(w, h) and min(w, h) < min(720, min(self.cfg.width, self.cfg.height)):
+            if min(w, h) and min(w, h) < (min_side or min(720, min(self.cfg.width, self.cfg.height))):
                 continue                                                      # too low-res: blurry
             ders = [x for x in info.get("derivatives", []) if x.get("src") and x.get("height")
                     and "audio" not in (x.get("type") or "")]
             target = min(self.cfg.width, self.cfg.height)                     # 1080p when available
-            ders = [x for x in ders if 720 <= min(int(x["height"]), int(x.get("width") or 9999)) <= 1080] or ders
+            lo = min_side or 720
+            ders = [x for x in ders if lo <= min(int(x["height"]), int(x.get("width") or 9999)) <= 1080] or ders
             if not ders:
                 continue
             best = min(ders, key=lambda x: abs(int(x["height"]) - target))
             meta = info.get("extmetadata") or {}
             artist = re.sub(r"<[^>]+>", "", (meta.get("Artist") or {}).get("value", "")).strip()[:80] or "Unknown"
             lic = (meta.get("LicenseShortName") or {}).get("value", "")
-            out.append(Media("video", "commons", f"commons_{p.get('pageid')}", url=best["src"], duration=dur,
+            out.append(Media("video", "commons", f"commons_{p.get('pageid')}", url=best["src"], duration=dur,  # noqa
                              credit=f"Video by {artist} ({lic}) via Wikimedia Commons",
+                             page=info.get("descriptionurl", "")))
+        return out
+
+    def commons_photos(self, q: str) -> list[Media]:
+        """Wikimedia Commons free-licensed photos and historical images — huge, high-res, no key."""
+        d = self._cached_get("commons_p", "https://commons.wikimedia.org/w/api.php",
+                             {"action": "query", "format": "json", "generator": "search", "gsrnamespace": 6,
+                              "gsrsearch": f"{q} filetype:bitmap", "gsrlimit": 30, "prop": "imageinfo",
+                              "iiprop": "url|size|mime|extmetadata", "iiurlwidth": 2560}, {})
+        portrait = self.cfg.height > self.cfg.width
+        need = min(self.cfg.width, self.cfg.height)
+        out = []
+        pages = ((d or {}).get("query") or {}).get("pages") or {}
+        for p in sorted(pages.values(), key=lambda p: p.get("index", 0)):
+            info = (p.get("imageinfo") or [{}])[0]
+            title = re.sub(r"^File:|\.[a-z0-9]+$", "", p.get("title", ""), flags=re.I).replace("_", " ")
+            w, h = int(info.get("width") or 0), int(info.get("height") or 0)
+            if info.get("mime") not in ("image/jpeg", "image/png", "image/webp") or not (w and h):
+                continue
+            if JUNK_RE.search(title) or re.search(r"\b(coat of arms|flag|seal|signature|plan|icon)\b", title, re.I):
+                continue
+            if min(w, h) < need * 0.8:
+                continue                                                      # too small: blurry
+            if (not portrait and h > w * 1.15) or (portrait and w > h * 1.15):
+                continue                                                      # wrong orientation
+            meta = info.get("extmetadata") or {}
+            artist = re.sub(r"<[^>]+>", "", (meta.get("Artist") or {}).get("value", "")).strip()[:80] or "Unknown"
+            lic = (meta.get("LicenseShortName") or {}).get("value", "")
+            out.append(Media("image", "commons", f"commons_p{p.get('pageid')}",
+                             url=info.get("thumburl") or info["url"],
+                             credit=f"Image by {artist} ({lic}) via Wikimedia Commons",
                              page=info.get("descriptionurl", "")))
         return out
 
@@ -628,12 +664,14 @@ class StockFinder:
             providers = [self.local_matches, self.pexels_videos, self.pixabay_videos,
                          self.pexels_photos, self.unsplash_photos, self.pixabay_photos,
                          self.commons_videos, self.openverse_photos]
-        if not has_keys:  # keyless: sharp HD photos (Ken Burns) first, then HD Commons videos
+        if not has_keys:  # keyless: HD Commons video, then sharp HD photos (Ken Burns)
             providers = [p for p in providers if p not in (self.commons_videos, self.openverse_photos)] + \
-                        [self.openverse_photos, self.commons_videos]
+                        ([self.commons_photos, self.openverse_photos, self.commons_videos]
+                         if self.cfg.prefer == "photo" else
+                         [self.commons_videos, self.commons_photos, self.openverse_photos])
         if has_keys:  # keyless sources are only a fallback when keys exist
             providers = [p for p in providers if p not in (self.commons_videos, self.openverse_photos)] + \
-                        [self.commons_videos, self.openverse_photos]
+                        [self.commons_videos, self.commons_photos, self.openverse_photos]
         chosen: list[Media] = []
         for k in range(n):
             own = scene.shot_queries[k] if k < len(scene.shot_queries) else []
@@ -649,6 +687,12 @@ class StockFinder:
                         break
                 if got:
                     break
+            if got is None:                          # last resort: softer (360p+) clips beat a blank shot
+                for q in queries:
+                    cands = [m for m in self.commons_videos_relaxed(q) if m.key not in self.used]
+                    if cands:
+                        got = cands[0]
+                        break
             if got is None and self.local:          # reuse local footage at random
                 fresh = [p for p in self.local if f"local_{p}" not in self.used] or self.local
                 got = self._local_media(random.Random(sha(scene.text, k)).choice(fresh))
