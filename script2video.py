@@ -35,6 +35,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -275,7 +276,9 @@ class StockFinder:
         self.cache = cache
         self.used: set[str] = set()
         self.http = requests.Session()
-        self.http.headers["User-Agent"] = "script2video/1.0"
+        # Wikimedia requires a descriptive User-Agent with a contact URL
+        self.http.headers["User-Agent"] = "script2video/1.1 (https://github.com/Farhan-Team/script2video)"
+        self.wiki_gate = threading.Semaphore(1)   # Wikimedia rate-limits parallel downloads
         self.local: list[Path] = []
         if cfg.media_dir:
             self.local = sorted(p for p in Path(cfg.media_dir).rglob("*")
@@ -413,7 +416,7 @@ class StockFinder:
                 continue
             ders = [x for x in info.get("derivatives", []) if x.get("src") and x.get("height")
                     and "audio" not in (x.get("type") or "")]
-            target = min(self.cfg.width, self.cfg.height)
+            target = min(720, min(self.cfg.width, self.cfg.height))
             ders = [x for x in ders if 480 <= int(x["height"]) <= 1080] or ders
             if not ders:
                 continue
@@ -498,21 +501,40 @@ class StockFinder:
         dest = self.cache / f"{m.source}_{sha(m.url)}{ext}"
         if not (dest.exists() and dest.stat().st_size > 0):
             tmp = dest.with_name(dest.stem + ".part" + ext)
-            for attempt in range(3):
+            wiki = "wikimedia.org" in m.url
+            gate = self.wiki_gate if wiki else None
+            tries = 6 if wiki else 3
+            for attempt in range(tries):
                 try:
-                    with self.http.get(m.url, stream=True, timeout=60) as r:
-                        r.raise_for_status()
-                        with open(tmp, "wb") as fh:
-                            for chunk in r.iter_content(1 << 16):
-                                fh.write(chunk)
+                    if gate:
+                        gate.acquire()
+                    try:
+                        with self.http.get(m.url, stream=True, timeout=90) as r:
+                            if r.status_code == 429:
+                                wait = float(r.headers.get("Retry-After") or 0) or 4 * (attempt + 1)
+                                raise requests.HTTPError(f"429 rate limited, waiting {wait:.0f}s",
+                                                         response=r)
+                            r.raise_for_status()
+                            with open(tmp, "wb") as fh:
+                                for chunk in r.iter_content(1 << 16):
+                                    fh.write(chunk)
+                        if wiki:
+                            time.sleep(0.5)          # be polite between Wikimedia downloads
+                    finally:
+                        if gate:
+                            gate.release()
                     tmp.replace(dest)
                     break
                 except requests.RequestException as e:
-                    if attempt == 2:
+                    if attempt == tries - 1:
                         log(f"  ! download failed ({e}); using a plain background for this shot")
                         m.kind, m.source = "color", "none"
                         return
-                    time.sleep(2)
+                    resp = getattr(e, "response", None)
+                    if resp is not None and resp.status_code == 429:
+                        time.sleep(min(30, float(resp.headers.get("Retry-After") or 0) or 4 * (attempt + 1)))
+                    else:
+                        time.sleep(2)
             if m.ping and self.cfg.unsplash_key:  # required by Unsplash API guidelines
                 try:
                     self.http.get(m.ping, headers={"Authorization": f"Client-ID {self.cfg.unsplash_key}"}, timeout=15)
