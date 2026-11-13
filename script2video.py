@@ -881,10 +881,17 @@ def caption_font(text: str, cfg: Config) -> tuple[str, float]:
     return cfg.font, 1.0
 
 
+# Urdu letters some fonts (e.g. DejaVu Sans) lack -> look-alike Arabic letters they do have
+URDU_FALLBACK = str.maketrans({"\u06C1": "\u0647", "\u06C2": "\u06C0", "\u06C3": "\u0629"})
+
+
 def write_ass(scene: Scene, cfg: Config, path: Path) -> None:
     W, H = cfg.width, cfg.height
     vertical = H > W
     font, factor = caption_font(scene.text, cfg)
+    if font == "DejaVu Sans":
+        scene = Scene(scene.text.translate(URDU_FALLBACK), scene.tag, scene.queries, scene.audio,
+                      scene.speech_dur, [[a, b, w.translate(URDU_FALLBACK)] for a, b, w in scene.words])
     size = cfg.font_size or round((W * 0.052 if vertical else H * 0.056) * factor)
     if cfg.caption_style == "box":
         border, outline, shadow, back = 3, max(8, size // 5), 0, "&H64000000"
