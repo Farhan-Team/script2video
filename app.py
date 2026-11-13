@@ -26,8 +26,13 @@ FORMATS = {"Landscape 16:9 (YouTube) 1920x1080": (1920, 1080),
            "Vertical 9:16 (Shorts/Reels/TikTok)": (1080, 1920)}
 
 
+CAPTIONS = {"Word-by-word (highlight)": "words", "Phrases": "phrases", "Sentences": "sentences", "None": "none"}
+MOODS = ["cinematic ambient", "calm piano", "upbeat corporate", "inspiring", "documentary", "lofi chill",
+         "epic orchestral", "none"]
+
+
 def generate(script_file, script_text, voice, speed, fmt, prefer, captions, caption_style, clip_seconds,
-             music, music_volume, media_dir, pexels, pixabay, unsplash, progress=gr.Progress()):
+             mood, music, music_volume, media_dir, pexels, pixabay, unsplash, progress=gr.Progress()):
     text = ""
     if script_file:
         text = Path(script_file).read_text("utf-8", errors="ignore")
@@ -43,8 +48,10 @@ def generate(script_file, script_text, voice, speed, fmt, prefer, captions, capt
         workdir=WORK / s2v.sha(text, w, h),     # same script = resumes from cache
         voice=voice, rate=f"{int(speed):+d}%",
         width=w, height=h, prefer=prefer.lower(),
-        captions=captions.lower(), caption_style=caption_style.lower(), clip_seconds=float(clip_seconds),
+        captions=CAPTIONS.get(captions, "words"), caption_style=caption_style.lower(),
+        clip_seconds=float(clip_seconds),
         music=Path(music) if music else None, music_volume=float(music_volume),
+        auto_music=(not music) and mood != "none", music_mood=mood,
         media_dir=Path(media_dir) if media_dir and Path(media_dir).is_dir() else None,
         pexels_key=pexels.strip(), pixabay_key=pixabay.strip(), unsplash_key=unsplash.strip(),
         progress=lambda f, m: progress(f, desc=m),
@@ -69,12 +76,15 @@ with gr.Blocks(title="Script → Video") as demo:
             speed = gr.Slider(-30, 30, value=0, step=5, label="Speech speed (%)")
             fmt = gr.Dropdown(list(FORMATS), value=list(FORMATS)[0], label="Format")
             prefer = gr.Radio(["Video", "Photo"], value="Video", label="Stock footage type")
-            captions = gr.Radio(["Phrases", "Sentences", "None"], value="Phrases", label="Text overlay")
+            captions = gr.Radio(list(CAPTIONS), value="Word-by-word (highlight)", label="Text overlay")
             caption_style = gr.Radio(["Box", "Outline"], value="Box", label="Caption style")
             clip_seconds = gr.Slider(3, 15, value=6, step=1, label="Change shot every N seconds")
+            mood = gr.Dropdown(MOODS, value="cinematic ambient", label="Background music (free, automatic)",
+                               allow_custom_value=True)
     with gr.Accordion("Music, own footage & API keys", open=False):
-        music = gr.File(label="Background music (optional)", file_types=["audio"], type="filepath")
-        music_volume = gr.Slider(0.02, 0.4, value=0.12, step=0.01, label="Music volume")
+        music = gr.File(label="Your own music file (optional — replaces the automatic music)",
+                        file_types=["audio"], type="filepath")
+        music_volume = gr.Slider(0.02, 0.5, value=0.18, step=0.01, label="Music volume (dips under the voice)")
         media_dir = gr.Textbox(label="Folder with your own footage (optional, matched by file name)",
                                value=os.getenv("S2V_MEDIA_DIR", ""))
         pexels = gr.Textbox(label="Pexels API key", value=os.getenv("PEXELS_API_KEY", ""), type="password")
@@ -85,7 +95,7 @@ with gr.Blocks(title="Script → Video") as demo:
     video = gr.Video(label="Result")
     credits = gr.File(label="Footage credits")
     btn.click(generate, [script_file, script_text, voice, speed, fmt, prefer, captions, caption_style,
-                         clip_seconds, music, music_volume, media_dir, pexels, pixabay, unsplash],
+                         clip_seconds, mood, music, music_volume, media_dir, pexels, pixabay, unsplash],
               [video, credits])
 
 if __name__ == "__main__":

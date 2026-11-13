@@ -1,9 +1,10 @@
 # script2video: script in, 10+ minute video out (free)
 
 You give it a script, and you get back a narrated MP4 with:
-- stock footage from Pexels, Pixabay or Unsplash, or your own clips
-- text captions on screen
-- optional background music
+- stock footage from Pexels, Pixabay or Unsplash, or your own clips. With no API key it uses free Wikimedia Commons videos and Openverse photos. Each shot is matched to what is being said at that moment.
+- word-by-word captions: the spoken word lights up, TikTok/YouTube style
+- free background music, picked automatically, that gets quieter whenever the voice speaks
+- fast rendering on an NVIDIA GPU (for example Colab's free T4), with automatic fallback to the CPU
 
 **Everything is free:**
 - voices come from Microsoft Edge's neural voices, through `edge-tts`
@@ -66,6 +67,8 @@ Your PC does the rendering.
 ```
 python script2video.py my_script.txt
 python script2video.py my_script.txt --voice en-GB-RyanNeural --music bg.mp3
+python script2video.py my_script.txt --music auto --music-mood "calm piano"
+python script2video.py my_script.txt --captions phrases      # plain phrases, no highlight
 python script2video.py my_script.txt --vertical              # Shorts / Reels
 python script2video.py my_script.txt --size 1280x720          # renders ~2x faster
 python script2video.py my_script.txt --media-dir D:\footage   # your own clips first

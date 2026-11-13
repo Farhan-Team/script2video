@@ -100,18 +100,22 @@ class Config:
     pixabay_key: str = ""
     unsplash_key: str = ""
     # captions
-    captions: str = "phrases"         # phrases | sentences | none
+    captions: str = "words"           # words (highlight as spoken) | phrases | sentences | none
     caption_style: str = "box"        # box | outline
     font: str = "Arial"
     font_size: int = 0                # 0 = auto
-    caption_words: int = 7
+    caption_words: int = 6
+    highlight: str = "&H0000D7FF"     # ASS colour (BGR) of the spoken word — gold
     # audio
-    music: Optional[Path] = None
-    music_volume: float = 0.12
+    music: Optional[Path] = None      # a file, or None
+    auto_music: bool = False          # fetch free background music (Openverse, no key)
+    music_mood: str = "cinematic ambient"
+    music_volume: float = 0.18        # music dips automatically under the voice
     # encoding
     crf: int = 23
     preset: str = "veryfast"
-    workers: int = 2
+    encoder: str = "auto"             # auto (GPU if available) | gpu | cpu
+    workers: int = 0                  # 0 = one per CPU core
     progress: Callable[[float, str], None] = field(default=lambda f, m: None, repr=False)
 
 
@@ -122,7 +126,9 @@ class Scene:
     queries: list[str] = field(default_factory=list)
     audio: Optional[Path] = None
     speech_dur: float = 0.0
+    words: list = field(default_factory=list)      # [start, end, word] from the voice engine
     media: list["Media"] = field(default_factory=list)
+    shot_queries: list = field(default_factory=list)  # per-shot search terms
 
 
 @dataclass
@@ -197,44 +203,95 @@ def _words(text: str) -> list[str]:
     return out
 
 
-def assign_queries(scenes: list[Scene]) -> None:
-    """Pick stock-search keywords per scene with a small TF-IDF."""
-    docs = [_words(s.text) for s in scenes]
-    df = Counter()
-    for d in docs:
-        df.update(set(d))
-    n = max(1, len(docs))
-    total = Counter(w for d in docs for w in d)
-    topic = [w for w, _ in total.most_common(3)]
-    for s, d in zip(scenes, docs):
+class QueryMaker:
+    """Stock-search keywords from a small TF-IDF over the script, preferring
+    two-word phrases that appear in the text ("sand dunes", "city skyline")."""
+
+    def __init__(self, scenes: list[Scene]):
+        docs = [_words(s.text) for s in scenes]
+        self.df = Counter()
+        for d in docs:
+            self.df.update(set(d))
+        self.n = max(1, len(docs))
+        total = Counter(w for d in docs for w in d)
+        self.topic = [w for w, _ in total.most_common(3)]
+
+    def __call__(self, text: str, tag: Optional[str] = None) -> list[str]:
+        d = _words(text)
         tf = Counter(d)
         L = max(1, len(d))
-        # frequent in this scene + appears early (the subject usually comes first),
-        # with a light rarity boost so every scene doesn't get the same query
-        def score(w: str) -> float:
-            return tf[w] + 1.2 * (1 - d.index(w) / L) + 0.25 * math.log(1 + n / df[w])
+
+        def score(w: str) -> float:   # frequent here + appears early + a bit rare overall
+            return tf[w] + 1.2 * (1 - d.index(w) / L) + 0.25 * math.log(1 + self.n / max(1, self.df[w]))
+
         ranked = sorted(tf, key=lambda w: -score(w))
+        # adjacent content-word pairs straight from the text
+        pairs = []
+        for clause in re.split(r"[,.;:!?()\"—–]+", text.lower()):   # never pair across punctuation
+            toks = [re.sub(r"'s$", "", t).strip("-'") for t in re.findall(r"[a-z][a-z'\-]+", clause)]
+            for a, b in zip(toks, toks[1:]):
+                if a in tf and b in tf and a != b:
+                    pairs.append((score(a) + score(b), f"{a} {b}"))
+        pairs.sort(key=lambda x: -x[0])
         q: list[str] = []
-        if s.tag:
-            q.append(s.tag)
+        if tag:
+            q.append(tag)
+        q += [p for _, p in pairs[:2]]
         if len(ranked) >= 2:
             q.append(f"{ranked[0]} {ranked[1]}")
         q += ranked[:3]
-        if topic:
-            q.append(topic[0])
-        q.append("abstract background")
-        seen, s.queries = set(), []
+        seen, out = set(), []
         for item in q:
             if item and item not in seen:
                 seen.add(item)
-                s.queries.append(item)
+                out.append(item)
+        return out
+
+    def fallback(self) -> list[str]:
+        return ([self.topic[0]] if self.topic else []) + ["abstract background"]
+
+
+def split_for_shots(text: str, n: int) -> list[str]:
+    """Split a scene's text into n consecutive parts (on sentence edges when possible)
+    so each shot is matched to what is being said while it is on screen."""
+    if n <= 1:
+        return [text]
+    sents = [x for x in SENT_RE.split(text) if x.strip()]
+    if len(sents) >= n:
+        parts, per = [], len(sents) / n
+        for k in range(n):
+            parts.append(" ".join(sents[round(k * per):round((k + 1) * per)]))
+        return [p for p in parts if p] or [text]
+    words = text.split()
+    per = max(1, math.ceil(len(words) / n))
+    return [" ".join(words[k * per:(k + 1) * per]) or text for k in range(n)]
+
+
+def assign_queries(scenes: list[Scene]) -> QueryMaker:
+    qm = QueryMaker(scenes)
+    for s in scenes:
+        s.queries = qm(s.text, s.tag) + [x for x in qm.fallback() if x not in qm(s.text, s.tag)]
+    return qm
 
 
 # --------------------------------------------------------------------------- text to speech
 
-async def _edge_save(text: str, voice: str, rate: str, path: Path) -> None:
+async def _edge_save(text: str, voice: str, rate: str, path: Path) -> list:
+    """Save the voiceover and return word timings [[start, end, word], ...] in seconds."""
     import edge_tts
-    await edge_tts.Communicate(text, voice, rate=rate).save(str(path))
+    try:
+        comm = edge_tts.Communicate(text, voice, rate=rate, boundary="WordBoundary")
+    except TypeError:                       # edge-tts < 7 always sends word boundaries
+        comm = edge_tts.Communicate(text, voice, rate=rate)
+    words = []
+    with open(path, "wb") as fh:
+        async for chunk in comm.stream():
+            if chunk["type"] == "audio":
+                fh.write(chunk["data"])
+            elif chunk["type"] == "WordBoundary":
+                st = chunk["offset"] / 1e7
+                words.append([st, st + chunk["duration"] / 1e7, chunk["text"]])
+    return words
 
 
 def _system_tts(text: str, path: Path) -> None:
@@ -247,13 +304,15 @@ def _system_tts(text: str, path: Path) -> None:
 def synthesize(scene: Scene, cfg: Config, tts_dir: Path) -> None:
     ext = ".mp3" if cfg.tts == "edge" else ".wav"
     path = tts_dir / f"tts_{sha(scene.text, cfg.voice, cfg.rate, cfg.tts)}{ext}"
-    if not (path.exists() and path.stat().st_size > 0):
+    wpath = path.with_suffix(".words.json")
+    need_words = cfg.tts == "edge" and not wpath.exists()
+    if need_words or not (path.exists() and path.stat().st_size > 0):
         tmp = path.with_name(path.stem + ".part" + ext)
         if cfg.tts == "edge":
-            last = None
+            last, words = None, []
             for attempt in range(4):
                 try:
-                    asyncio.run(_edge_save(scene.text, cfg.voice, cfg.rate, tmp))
+                    words = asyncio.run(_edge_save(scene.text, cfg.voice, cfg.rate, tmp))
                     if tmp.exists() and tmp.stat().st_size > 0:
                         break
                 except Exception as e:  # network hiccup / throttling
@@ -261,14 +320,76 @@ def synthesize(scene: Scene, cfg: Config, tts_dir: Path) -> None:
                 time.sleep(1.5 * (attempt + 1))
             else:
                 raise RuntimeError(f"edge-tts failed ({last}). Check your internet, or use --tts system")
+            wpath.write_text(json.dumps(words), "utf-8")
         else:
             _system_tts(scene.text, tmp)
         tmp.replace(path)
     scene.audio = path
     scene.speech_dur = probe_duration(path)
+    if wpath.exists():
+        try:
+            scene.words = json.loads(wpath.read_text("utf-8"))
+        except ValueError:
+            scene.words = []
+
+
+def align_words(text: str, bounds: list, speech_dur: float) -> list:
+    """Attach the voice engine's word timings to the script's own words (which keep
+    their punctuation). Words the engine split or expanded ("70%" → "seventy
+    percent") get their times interpolated from their neighbours."""
+    toks = text.split()
+    norm = lambda x: re.sub(r"[^\w]", "", x.lower())
+    times: list = [None] * len(toks)
+    j = 0
+    for b0, b1, bt in bounds:
+        nb = norm(bt)
+        if not nb:
+            continue
+        for k in range(j, min(j + 4, len(toks))):
+            nt = norm(toks[k])
+            if nt and (nt == nb or nb in nt or nt in nb):
+                if times[k] is None:
+                    times[k] = [b0, b1]
+                else:
+                    times[k][1] = b1
+                j = k + 1 if (nt == nb or nt.endswith(nb) or nb.endswith(nt)) else k
+                break
+    known = [i for i, t in enumerate(times) if t]
+    if not known:   # no timings at all: spread evenly by length
+        tot = sum(len(t) + 2 for t in toks) or 1
+        t, out = 0.0, []
+        for tok in toks:
+            d = speech_dur * (len(tok) + 2) / tot
+            out.append([t, t + d, tok])
+            t += d
+        return out
+    i = 0
+    while i < len(toks):
+        if times[i] is None:
+            k = i
+            while k < len(toks) and times[k] is None:
+                k += 1
+            a = times[i - 1][1] if i > 0 else 0.0
+            b = times[k][0] if k < len(toks) else max(a + 0.3 * (k - i), speech_dur)
+            step = max(0.05, (b - a) / (k - i))
+            for m in range(i, k):
+                times[m] = [a + step * (m - i), a + step * (m - i + 1)]
+            i = k
+        else:
+            i += 1
+    return [[t[0], t[1], tok] for t, tok in zip(times, toks)]
 
 
 # --------------------------------------------------------------------------- stock media
+
+# Results whose titles look like talks, title cards, maps or charts rarely work as b-roll
+JUNK_RE = re.compile(r"\b(lecture|interview|talk|talks|speech|conference|presentation|panel|webinar|podcast|"
+                     r"seminar|keynote|press|briefing|debate|tutorial|explained|explainer|news|trailer|"
+                     r"intro|title|titles|credits|logo|logos|map|maps|diagram|chart|graph|infographic|"
+                     r"animation|animated|simulation|screencast|screenshot|slideshow|slides|episode|"
+                     r"documentary|wikipedia|wikimedia|commons|lesson|course|class|meeting|hearing|"
+                     r"visualization|visualisation|model|render|cgi|3d|game|gameplay)\b", re.I)
+
 
 class StockFinder:
     def __init__(self, cfg: Config, cache: Path):
@@ -409,11 +530,16 @@ class StockFinder:
                               "prop": "videoinfo", "viprop": "url|size|derivatives|extmetadata"}, {})
         out = []
         pages = ((d or {}).get("query") or {}).get("pages") or {}
+        portrait = self.cfg.height > self.cfg.width
         for p in sorted(pages.values(), key=lambda p: p.get("index", 0)):
             info = (p.get("videoinfo") or [{}])[0]
             dur = float(info.get("duration") or 0)
-            if dur and dur < 3:
+            title = re.sub(r"^File:|\.[a-z0-9]+$", "", p.get("title", ""), flags=re.I).replace("_", " ")
+            if (dur and dur < 3) or dur > 1200 or JUNK_RE.search(title):   # long = usually a talk/film
                 continue
+            w, h = int(info.get("width") or 0), int(info.get("height") or 0)
+            if w and h and ((h > w) != portrait) and abs(w - h) > 0.1 * max(w, h):
+                continue                                                      # wrong orientation
             ders = [x for x in info.get("derivatives", []) if x.get("src") and x.get("height")
                     and "audio" not in (x.get("type") or "")]
             target = min(720, min(self.cfg.width, self.cfg.height))
@@ -437,7 +563,7 @@ class StockFinder:
                               "size": "large", "mature": "false"}, {})
         out = []
         for r in (d or {}).get("results", []):
-            if not r.get("url"):
+            if not r.get("url") or JUNK_RE.search(r.get("title") or ""):
                 continue
             out.append(Media("image", "openverse", f"openverse_{r.get('id')}", url=r["url"],
                              credit=f"Photo by {r.get('creator') or 'Unknown'} "
@@ -445,6 +571,28 @@ class StockFinder:
                                     f"via {r.get('source') or 'Openverse'}".replace("  ", " "),
                              page=r.get("foreign_landing_url", "")))
         return out
+
+    def find_music(self, mood: str, seed: str) -> Optional[Media]:
+        """Free background music from Openverse (Jamendo, ccMixter, Freesound…), no key.
+        Only licenses that allow commercial use, so monetised YouTube videos are fine."""
+        for q in (mood, f"{mood.split()[0]} instrumental", "ambient instrumental", "cinematic"):
+            d = self._cached_get("openverse_a", "https://api.openverse.org/v1/audio/",
+                                 {"q": q, "page_size": 20, "category": "music", "license_type": "commercial",
+                                  "length": "medium,long", "mature": "false"}, {})
+            cands = [r for r in (d or {}).get("results", []) if r.get("url")
+                     and (r.get("duration") or 0) >= 60_000
+                     and not re.search(r"\b(vocal|vocals|song|lyrics|remix|rap|speech|podcast)\b",
+                                       (r.get("title") or "") + " " + " ".join(t.get("name", "") for t in
+                                                                               (r.get("tags") or [])), re.I)]
+            if cands:
+                r = random.Random(seed).choice(cands[:8])
+                return Media("audio", "openverse", f"music_{r.get('id')}", url=r["url"],
+                             duration=(r.get("duration") or 0) / 1000,
+                             credit=f"Music: \"{r.get('title') or 'Untitled'}\" by {r.get('creator') or 'Unknown'} "
+                                    f"({(r.get('license') or '').upper()} {r.get('license_version') or ''}) "
+                                    f"via {r.get('source') or 'Openverse'}",
+                             page=r.get("foreign_landing_url", ""))
+        return None
 
     def local_matches(self, q: str) -> list[Media]:
         words = [w for w in re.findall(r"[a-z0-9]+", q.lower()) if len(w) > 2]
@@ -458,6 +606,8 @@ class StockFinder:
 
     # ---- selection
     def pick(self, scene: Scene, n: int, seg: float) -> list[Media]:
+        """One clip per shot. Each shot first searches for what is being said while it is on
+        screen (scene.shot_queries[k]), then falls back to the scene's overall keywords."""
         has_keys = bool(self.cfg.pexels_key or self.cfg.pixabay_key or self.cfg.unsplash_key)
         if self.cfg.prefer == "photo":
             providers = [self.local_matches, self.pexels_photos, self.unsplash_photos, self.pixabay_photos,
@@ -470,34 +620,33 @@ class StockFinder:
             providers = [p for p in providers if p not in (self.commons_videos, self.openverse_photos)] + \
                         [self.commons_videos, self.openverse_photos]
         chosen: list[Media] = []
-        for q in scene.queries:
-            for prov in providers:
-                if len(chosen) >= n:
-                    break
-                cands = [m for m in prov(q) if m.key not in self.used]
-                # clips long enough to cover the shot without looping come first
-                cands.sort(key=lambda m: 0 if (m.kind != "video" or m.duration >= seg) else 1)
-                for m in cands:
-                    if len(chosen) >= n:
+        for k in range(n):
+            own = scene.shot_queries[k] if k < len(scene.shot_queries) else []
+            queries = own + [q for q in scene.queries if q not in own]
+            got = None
+            for q in queries:
+                for prov in providers:
+                    cands = [m for m in prov(q) if m.key not in self.used]
+                    # clips long enough to cover the shot without looping come first
+                    cands.sort(key=lambda m: 0 if (m.kind != "video" or m.duration >= seg) else 1)
+                    if cands:
+                        got = cands[0]
                         break
-                    chosen.append(m)
-                    self.used.add(m.key)
-            if len(chosen) >= n:
-                break
-        # nothing matched: reuse local footage at random, then a plain gradient
-        while len(chosen) < n and self.local:
-            fresh = [p for p in self.local if f"local_{p}" not in self.used] or self.local
-            p = random.Random(sha(scene.text, len(chosen))).choice(fresh)
-            self.used.add(f"local_{p}")
-            chosen.append(self._local_media(p))
-        while len(chosen) < n:
-            chosen.append(Media("color", "none", f"color{len(chosen)}"))
+                if got:
+                    break
+            if got is None and self.local:          # reuse local footage at random
+                fresh = [p for p in self.local if f"local_{p}" not in self.used] or self.local
+                got = self._local_media(random.Random(sha(scene.text, k)).choice(fresh))
+            if got is None:
+                got = Media("color", "none", f"color{k}")
+            self.used.add(got.key)
+            chosen.append(got)
         return chosen
 
     def download(self, m: Media) -> None:
         if m.path or m.kind == "color":
             return
-        ext = ".mp4" if m.kind == "video" else ".jpg"
+        ext = {"video": ".mp4", "image": ".jpg"}.get(m.kind) or (Path(m.url.split("?")[0]).suffix or ".mp3")
         dest = self.cache / f"{m.source}_{sha(m.url)}{ext}"
         if not (dest.exists() and dest.stat().st_size > 0):
             tmp = dest.with_name(dest.stem + ".part" + ext)
@@ -623,8 +772,15 @@ def write_ass(scene: Scene, cfg: Config, path: Path) -> None:
         "Alignment, MarginL, MarginR, MarginV, Encoding",
         f"Style: Default,{cfg.font},{size},&H00FFFFFF,&H000000FF,{outc},{back},-1,0,0,0,100,100,0,0,"
         f"{border},{outline},{shadow},2,{margin_lr},{margin_lr},{margin_v},1",
+        # same layout without a box: drawn on top of the boxed line for word highlighting
+        f"Style: Hi,{cfg.font},{size},&H00FFFFFF,&H000000FF,&H00000000,&HFF000000,-1,0,0,0,100,100,0,0,"
+        f"1,0,0,2,{margin_lr},{margin_lr},{margin_v},1",
         "", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
+    if cfg.captions == "words":
+        lines += karaoke_events(scene, cfg)
+        path.write_text("\n".join(lines) + "\n", "utf-8")
+        return
     chunks = caption_chunks(scene.text, cfg.captions, cfg.caption_words)
     weights = [len(c) + 6 for c in chunks]          # +6 ≈ the small pause at each break
     total_w = sum(weights) or 1
@@ -636,13 +792,80 @@ def write_ass(scene: Scene, cfg: Config, path: Path) -> None:
     path.write_text("\n".join(lines) + "\n", "utf-8")
 
 
+def karaoke_events(scene: Scene, cfg: Config) -> list[str]:
+    """Short phrases on screen; the word being spoken lights up (TikTok / YouTube style).
+    Exact timings come from the voice engine; without them, timing is estimated."""
+    words = align_words(scene.text, scene.words, scene.speech_dur)
+    groups, buf = [], []
+    for w in words:
+        buf.append(w)
+        if len(buf) >= cfg.caption_words or (w[2][-1:] in ".!?,;:؟۔…" and len(buf) >= 3):
+            groups.append(buf)
+            buf = []
+    if buf:
+        if groups and len(buf) <= 2:
+            groups[-1] += buf
+        else:
+            groups.append(buf)
+    hl = cfg.highlight
+    boxed = cfg.caption_style == "box"
+    events = []
+    for gi, g in enumerate(groups):
+        g_end = groups[gi + 1][0][0] if gi + 1 < len(groups) else max(g[-1][1], scene.speech_dur)
+        if boxed:   # one continuous box per phrase (colour changes would otherwise split the box)
+            plain = " ".join(ass_escape(t) for _, _, t in g)
+            events.append(f"Dialogue: 0,{ass_time(g[0][0])},{ass_time(g_end)},Default,,0,0,0,,{plain}")
+        for i, (st, en, _) in enumerate(g):
+            start = g[0][0] if i == 0 else st
+            end = g[i + 1][0] if i + 1 < len(g) else g_end
+            if end - start < 0.02:
+                continue
+            txt = " ".join((f"{{\\1c{hl}&}}{ass_escape(t)}{{\\r}}" if j == i else ass_escape(t))
+                           for j, (_, _, t) in enumerate(g))
+            events.append(f"Dialogue: 1,{ass_time(start)},{ass_time(end)},{'Hi' if boxed else 'Default'},,0,0,0,,{txt}")
+    return events
+
+
+# --------------------------------------------------------------------------- encoder (GPU / CPU)
+
+_ENC_LOCK = threading.Lock()
+_ENC_CACHE: dict = {}
+
+
+def video_encoder_args(cfg: Config) -> list[str]:
+    """NVIDIA GPU encoding (NVENC) when available — e.g. Colab's free T4 — else x264 on the CPU."""
+    with _ENC_LOCK:
+        key = (cfg.encoder, cfg.crf, cfg.preset)
+        if key in _ENC_CACHE:
+            return _ENC_CACHE[key]
+        args = ["-c:v", "libx264", "-preset", cfg.preset, "-crf", str(cfg.crf)]
+        if cfg.encoder in ("auto", "gpu"):
+            for preset in ("p4", "fast"):
+                trial = ["-c:v", "h264_nvenc", "-preset", preset, "-rc", "vbr", "-cq", str(cfg.crf + 1),
+                         "-b:v", "0", "-spatial-aq", "1"] if preset == "p4" else \
+                        ["-c:v", "h264_nvenc", "-preset", preset, "-rc", "vbr", "-cq", str(cfg.crf + 1)]
+                test = subprocess.run([ffmpeg_bin(), "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                                       "-i", "color=s=640x360:r=30:d=0.5", *trial, "-pix_fmt", "yuv420p",
+                                       "-f", "null", "-"], capture_output=True, text=True)
+                if test.returncode == 0:
+                    args = trial
+                    break
+            else:
+                if cfg.encoder == "gpu":
+                    log("  ! GPU encoder (NVENC) not available here — using the CPU")
+        log("• Encoder: " + ("GPU (NVENC)" if "h264_nvenc" in args else "CPU (x264)"))
+        _ENC_CACHE[key] = args
+        return args
+
+
 # --------------------------------------------------------------------------- scene rendering
 
 def render_scene(idx: int, scene: Scene, cfg: Config, sdir: Path) -> Path:
     W, H, FPS = cfg.width, cfg.height, cfg.fps
     total = scene.speech_dur + cfg.pause
     sig = sha(scene.text, scene.audio, [str(m.path or m.key) for m in scene.media], W, H, FPS, cfg.captions,
-              cfg.caption_style, cfg.font, cfg.font_size, cfg.caption_words, cfg.pause, cfg.crf, cfg.preset)
+              cfg.caption_style, cfg.font, cfg.font_size, cfg.caption_words, cfg.pause, cfg.crf, cfg.preset,
+              video_encoder_args(cfg), cfg.highlight, json.dumps(scene.words))
     out = sdir / f"scene_{idx:04d}_{sig}.mp4"
     if out.exists() and out.stat().st_size > 0:
         return out
@@ -655,8 +878,11 @@ def render_scene(idx: int, scene: Scene, cfg: Config, sdir: Path) -> Path:
         if m.kind == "video":
             loop = ["-stream_loop", "-1"] if m.duration and m.duration < seg + 0.2 else []
             start = 0.0
-            if m.duration > seg + 2:                      # skip the often-static first second
-                start = min(1.0, m.duration - seg - 0.5)
+            if m.duration > seg + 2:
+                # stock clips: skip the often-static first second; Commons/archive clips often open
+                # with a title card, so start ~20% in (different offsets keep reused clips fresh)
+                lead = 1.0 if m.source in ("pexels", "pixabay", "local") else max(1.5, 0.2 * m.duration)
+                start = min(lead, m.duration - seg - 0.5)
             cmd += loop + ["-ss", f"{start:.2f}", "-t", f"{seg + 0.5:.3f}", "-i", str(m.path)]
             chains.append(f"[{k}:v]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},"
                           f"fps={FPS},setsar=1,trim=duration={seg:.3f},setpts=PTS-STARTPTS,format=yuv420p[v{k}]")
@@ -686,7 +912,7 @@ def render_scene(idx: int, scene: Scene, cfg: Config, sdir: Path) -> Path:
     chains.append(f"[{n}:a]aresample=44100,aformat=channel_layouts=stereo,apad=whole_dur={total:.3f}[aout]")
     tmp = out.with_name(out.stem + ".part.mp4")
     cmd += ["-filter_complex", ";".join(chains), "-map", "[vout]", "-map", "[aout]",
-            "-c:v", "libx264", "-preset", cfg.preset, "-crf", str(cfg.crf), "-pix_fmt", "yuv420p",
+            *video_encoder_args(cfg), "-pix_fmt", "yuv420p",
             "-r", str(FPS), "-g", str(FPS * 2),
             "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
             "-t", f"{total:.3f}", "-movflags", "+faststart", str(tmp.resolve())]
@@ -712,7 +938,15 @@ def build_video(cfg: Config) -> Path:
     scenes = parse_script(cfg.script_text, cfg.words_per_scene)
     if not scenes:
         raise ValueError("The script is empty.")
-    assign_queries(scenes)
+    qm = assign_queries(scenes)
+    t_start = time.time()
+    stage = {"t": t_start}
+
+    def lap(name: str) -> None:
+        now = time.time()
+        log(f"  ⏱ {name}: {now - stage['t']:.0f}s")
+        stage["t"] = now
+
     words = sum(len(s.text.split()) for s in scenes)
     log(f"• {len(scenes)} scenes, {words} words (≈{words / 150:.1f} min of narration)")
     if not (cfg.pexels_key or cfg.pixabay_key or cfg.unsplash_key or cfg.media_dir):
@@ -728,6 +962,7 @@ def build_video(cfg: Config) -> Path:
             cfg.progress(0.02 + 0.23 * done / len(scenes), f"Voiceover {done}/{len(scenes)}")
     runtime = sum(s.speech_dur + cfg.pause for s in scenes)
     log(f"• Voiceover done — video length {runtime / 60:.1f} min")
+    lap("voiceover")
 
     # 2. footage
     cfg.progress(0.25, "Finding stock footage…")
@@ -735,16 +970,29 @@ def build_video(cfg: Config) -> Path:
     for i, s in enumerate(scenes):
         total = s.speech_dur + cfg.pause
         n = max(1, round(total / cfg.clip_seconds))
+        s.shot_queries = [qm(part) for part in split_for_shots(s.text, n)]
         s.media = finder.pick(s, n, total / n)
         cfg.progress(0.25 + 0.10 * (i + 1) / len(scenes), f"Searching footage {i + 1}/{len(scenes)}")
     all_media = [m for s in scenes for m in s.media]
+    music_media = None
+    if cfg.auto_music and not cfg.music:
+        music_media = finder.find_music(cfg.music_mood, sha(cfg.script_text))
+        if music_media:
+            all_media.append(music_media)
+        else:
+            log("  ! No free background music found — continuing without music")
     done = 0
     with ThreadPoolExecutor(max_workers=6) as ex:
         for _ in ex.map(finder.download, all_media):
             done += 1
             cfg.progress(0.35 + 0.15 * done / len(all_media), f"Downloading media {done}/{len(all_media)}")
-    srcs = Counter(m.source for m in all_media)
+    srcs = Counter(m.source for m in all_media if m.kind != "audio")
     log("• Media: " + ", ".join(f"{v} {k}" for k, v in srcs.items()))
+    music_path = Path(cfg.music) if cfg.music else (
+        music_media.path if music_media and music_media.kind == "audio" and music_media.path else None)
+    if music_media and music_path:
+        log(f"• {music_media.credit}")
+    lap("footage")
 
     # 3. render scenes
     files: list[Optional[Path]] = [None] * len(scenes)
@@ -753,12 +1001,16 @@ def build_video(cfg: Config) -> Path:
     def _render(i: int) -> None:
         files[i] = render_scene(i, scenes[i], cfg, sdir)
 
-    with ThreadPoolExecutor(max_workers=max(1, cfg.workers)) as ex:
+    video_encoder_args(cfg)
+    workers = cfg.workers or max(2, os.cpu_count() or 2)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
         for _ in ex.map(_render, range(len(scenes))):
             done += 1
             cfg.progress(0.50 + 0.45 * done / len(scenes), f"Rendering scene {done}/{len(scenes)}")
             if done % 5 == 0 or done == len(scenes):
                 log(f"  rendered {done}/{len(scenes)}")
+
+    lap("rendering")
 
     # 4. join (+ music)
     cfg.progress(0.96, "Joining scenes…")
@@ -766,25 +1018,30 @@ def build_video(cfg: Config) -> Path:
     out.parent.mkdir(parents=True, exist_ok=True)
     listfile = work / "concat.txt"
     listfile.write_text("".join(f"file '{f.as_posix()}'\n" for f in files), "utf-8")
-    body = work / "joined.mp4" if cfg.music else out
+    body = work / "joined.mp4" if music_path else out
     run([ffmpeg_bin(), "-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
          "-i", str(listfile), "-c", "copy", "-movflags", "+faststart", str(body)])
-    if cfg.music:
+    if music_path:
         dur = probe_duration(body)
         fade = max(0.0, dur - 3)
+        # music "ducks" (gets quieter) automatically whenever the voice is speaking
         run([ffmpeg_bin(), "-y", "-hide_banner", "-loglevel", "error", "-i", str(body),
-             "-stream_loop", "-1", "-i", str(Path(cfg.music).resolve()),
+             "-stream_loop", "-1", "-i", str(Path(music_path).resolve()),
              "-filter_complex",
-             f"[1:a]aresample=44100,aformat=channel_layouts=stereo,volume={cfg.music_volume},"
+             f"[0:a]asplit=2[voice][key];"
+             f"[1:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,volume={cfg.music_volume},"
              f"afade=t=in:d=2,afade=t=out:st={fade:.2f}:d=3[m];"
-             f"[0:a][m]amix=inputs=2:duration=first:normalize=0[a]",
+             f"[key]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[k];"
+             f"[m][k]sidechaincompress=threshold=0.02:ratio=6:attack=20:release=500[duck];"
+             f"[voice][duck]amix=inputs=2:duration=first:normalize=0[a]",
              "-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
              "-t", f"{dur:.3f}", "-movflags", "+faststart", str(out)])
 
     credits = sorted({f"{m.credit} — {m.page}".rstrip(" —") for m in all_media if m.source not in ("none",)})
     out.with_suffix(".credits.txt").write_text("\n".join(credits) + "\n", "utf-8")
+    lap("joining")
     cfg.progress(1.0, "Done")
-    log(f"✓ Saved {out}  ({probe_duration(out) / 60:.1f} min)")
+    log(f"✓ Saved {out}  ({probe_duration(out) / 60:.1f} min) in {(time.time() - t_start) / 60:.1f} min")
     return out
 
 
@@ -816,16 +1073,20 @@ def main() -> None:
     ap.add_argument("--media-dir", type=Path, help="folder of your own footage/images (matched by file name)")
     ap.add_argument("--clip-seconds", type=float, default=6.0, help="change shot every ~N seconds")
     ap.add_argument("--words-per-scene", type=int, default=30)
-    ap.add_argument("--captions", choices=["phrases", "sentences", "none"], default="phrases")
+    ap.add_argument("--captions", choices=["words", "phrases", "sentences", "none"], default="words",
+                    help="words = highlight each word as it is spoken (default)")
     ap.add_argument("--caption-style", choices=["box", "outline"], default="box")
-    ap.add_argument("--caption-words", type=int, default=7, help="max words per caption (phrases mode)")
+    ap.add_argument("--caption-words", type=int, default=6, help="max words on screen at once")
     ap.add_argument("--font", default="Arial", help="caption font name installed on your system")
     ap.add_argument("--font-size", type=int, default=0)
-    ap.add_argument("--music", type=Path, help="background music file (loops, auto-faded)")
-    ap.add_argument("--music-volume", type=float, default=0.12)
+    ap.add_argument("--music", help="background music file, or 'auto' for free music (loops, ducks under voice)")
+    ap.add_argument("--music-mood", default="cinematic ambient", help="for --music auto, e.g. 'upbeat', 'calm piano'")
+    ap.add_argument("--music-volume", type=float, default=0.18)
     ap.add_argument("--pause", type=float, default=0.35, help="silence between scenes (s)")
     ap.add_argument("--workdir", type=Path, help="cache folder (default: <script>_work)")
-    ap.add_argument("--workers", type=int, default=2, help="scenes rendered in parallel")
+    ap.add_argument("--workers", type=int, default=0, help="scenes rendered in parallel (0 = one per CPU core)")
+    ap.add_argument("--encoder", choices=["auto", "gpu", "cpu"], default="auto",
+                    help="auto = NVIDIA GPU if available (e.g. Colab T4), else CPU")
     ap.add_argument("--crf", type=int, default=23, help="quality (lower = better, bigger)")
     ap.add_argument("--preset", default="veryfast")
     a = ap.parse_args()
@@ -848,8 +1109,11 @@ def main() -> None:
         pexels_key=os.getenv("PEXELS_API_KEY", ""), pixabay_key=os.getenv("PIXABAY_API_KEY", ""),
         unsplash_key=os.getenv("UNSPLASH_ACCESS_KEY", ""),
         captions=a.captions, caption_style=a.caption_style, caption_words=a.caption_words,
-        font=a.font, font_size=a.font_size, music=a.music, music_volume=a.music_volume,
-        crf=a.crf, preset=a.preset, workers=a.workers,
+        font=a.font, font_size=a.font_size,
+        music=Path(a.music) if a.music and a.music.lower() != "auto" else None,
+        auto_music=bool(a.music and a.music.lower() == "auto"), music_mood=a.music_mood,
+        music_volume=a.music_volume,
+        crf=a.crf, preset=a.preset, workers=a.workers, encoder=a.encoder,
     )
     t0 = time.time()
     build_video(cfg)
