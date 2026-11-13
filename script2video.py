@@ -548,10 +548,12 @@ class StockFinder:
             w, h = int(info.get("width") or 0), int(info.get("height") or 0)
             if w and h and ((h > w) != portrait) and abs(w - h) > 0.1 * max(w, h):
                 continue                                                      # wrong orientation
+            if min(w, h) and min(w, h) < min(720, min(self.cfg.width, self.cfg.height)):
+                continue                                                      # too low-res: blurry
             ders = [x for x in info.get("derivatives", []) if x.get("src") and x.get("height")
                     and "audio" not in (x.get("type") or "")]
-            target = min(720, min(self.cfg.width, self.cfg.height))
-            ders = [x for x in ders if 480 <= int(x["height"]) <= 1080] or ders
+            target = min(self.cfg.width, self.cfg.height)                     # 1080p when available
+            ders = [x for x in ders if 720 <= min(int(x["height"]), int(x.get("width") or 9999)) <= 1080] or ders
             if not ders:
                 continue
             best = min(ders, key=lambda x: abs(int(x["height"]) - target))
@@ -573,6 +575,8 @@ class StockFinder:
         for r in (d or {}).get("results", []):
             if not r.get("url") or JUNK_RE.search(r.get("title") or ""):
                 continue
+            if r.get("width") and r.get("height") and min(r["width"], r["height"]) < 0.6 * min(self.cfg.width, self.cfg.height):
+                continue                                                      # too small: blurry
             out.append(Media("image", "openverse", f"openverse_{r.get('id')}", url=r["url"],
                              credit=f"Photo by {r.get('creator') or 'Unknown'} "
                                     f"({(r.get('license') or '').upper()} {r.get('license_version') or ''}) "
@@ -624,6 +628,9 @@ class StockFinder:
             providers = [self.local_matches, self.pexels_videos, self.pixabay_videos,
                          self.pexels_photos, self.unsplash_photos, self.pixabay_photos,
                          self.commons_videos, self.openverse_photos]
+        if not has_keys:  # keyless: sharp HD photos (Ken Burns) first, then HD Commons videos
+            providers = [p for p in providers if p not in (self.commons_videos, self.openverse_photos)] + \
+                        [self.openverse_photos, self.commons_videos]
         if has_keys:  # keyless sources are only a fallback when keys exist
             providers = [p for p in providers if p not in (self.commons_videos, self.openverse_photos)] + \
                         [self.commons_videos, self.openverse_photos]
@@ -655,9 +662,11 @@ class StockFinder:
     def _fetch_segment(self, m: Media) -> bool:
         """Download only the part of a long remote video that the shot uses (HTTP range
         requests via FFmpeg) instead of the whole file — e.g. 1 MB instead of 20 MB."""
-        lead = 1.0 if m.source in ("pexels", "pixabay") else max(1.5, 0.2 * m.duration)
-        start = max(0.0, min(lead, m.duration - m.need - 0.5))
-        dest = self.cache / f"{m.source}_{sha(m.url, round(start, 1), round(m.need, 1))}.mkv"
+        # Read only the first part of the file, in order (seeking inside remote WebM files
+        # produced broken clips). The render step then skips the intro of this piece.
+        lead = 1.0 if m.source in ("pexels", "pixabay") else min(12.0, max(1.5, 0.2 * m.duration))
+        upto = min(m.duration, lead + m.need + 1.5)
+        dest = self.cache / f"{m.source}_{sha(m.url, round(upto, 1))}_head.mkv"
         if not (dest.exists() and dest.stat().st_size > 0):
             tmp = dest.with_name(dest.stem + ".part.mkv")
             gate = self.wiki_gate if "wikimedia.org" in m.url else None
@@ -667,7 +676,7 @@ class StockFinder:
                 try:
                     p = subprocess.run([ffmpeg_bin(), "-y", "-hide_banner", "-loglevel", "error",
                                         "-user_agent", self.http.headers["User-Agent"],
-                                        "-ss", f"{start:.2f}", "-i", m.url, "-t", f"{m.need + 1.0:.2f}",
+                                        "-i", m.url, "-t", f"{upto:.2f}",
                                         "-map", "0:v:0", "-c", "copy", str(tmp)],
                                        capture_output=True, text=True, timeout=180)
                 except subprocess.TimeoutExpired:
@@ -683,9 +692,10 @@ class StockFinder:
             else:
                 return False
         d = probe_duration(dest)
-        if d < min(1.0, m.need * 0.5):
+        if d < min(1.0, m.need * 0.5) or not decodes(dest):
+            dest.unlink(missing_ok=True)
             return False
-        m.path, m.duration, m.trimmed = dest.resolve(), d, True
+        m.path, m.duration = dest.resolve(), d      # render skips the intro as usual
         return True
 
     def download(self, m: Media) -> None:
@@ -749,6 +759,13 @@ def ffmpeg_bin() -> str:
     if not b:
         sys.exit("FFmpeg not found. Install it (https://ffmpeg.org/download.html) and make sure it's on PATH.")
     return b
+
+
+def decodes(path: Path) -> bool:
+    """True if FFmpeg can decode the first frames (catches truncated/broken downloads)."""
+    p = subprocess.run([ffmpeg_bin(), "-v", "error", "-i", str(path), "-frames:v", "5", "-f", "null", "-"],
+                       capture_output=True, text=True)
+    return p.returncode == 0 and "Invalid" not in p.stderr and "error" not in p.stderr.lower()
 
 
 def probe_duration(path: Path) -> float:
@@ -886,11 +903,12 @@ def video_encoder_args(cfg: Config) -> list[str]:
         key = (cfg.encoder, cfg.crf, cfg.preset)
         if key in _ENC_CACHE:
             return _ENC_CACHE[key]
-        args = ["-c:v", "libx264", "-preset", cfg.preset, "-crf", str(cfg.crf)]
+        cap = "5M" if max(cfg.width, cfg.height) >= 1920 else "3M"
+        args = ["-c:v", "libx264", "-preset", cfg.preset, "-crf", str(cfg.crf), "-maxrate", cap, "-bufsize", "10M"]
         if cfg.encoder in ("auto", "gpu"):
             for preset in ("p4", "fast"):
                 trial = ["-c:v", "h264_nvenc", "-preset", preset, "-rc", "vbr", "-cq", str(cfg.crf + 1),
-                         "-b:v", "0", "-spatial-aq", "1"] if preset == "p4" else \
+                         "-b:v", "0", "-maxrate", cap, "-bufsize", "10M", "-spatial-aq", "1"] if preset == "p4" else \
                         ["-c:v", "h264_nvenc", "-preset", preset, "-rc", "vbr", "-cq", str(cfg.crf + 1)]
                 test = subprocess.run([ffmpeg_bin(), "-hide_banner", "-loglevel", "error", "-f", "lavfi",
                                        "-i", "color=s=640x360:r=30:d=0.5", *trial, "-pix_fmt", "yuv420p",
@@ -929,7 +947,7 @@ def render_scene(idx: int, scene: Scene, cfg: Config, sdir: Path) -> Path:
             if m.duration > seg + 2 and not m.trimmed:
                 # stock clips: skip the often-static first second; Commons/archive clips often open
                 # with a title card, so start ~20% in (different offsets keep reused clips fresh)
-                lead = 1.0 if m.source in ("pexels", "pixabay", "local") else max(1.5, 0.2 * m.duration)
+                lead = 1.0 if m.source in ("pexels", "pixabay", "local") else min(12.0, max(1.5, 0.2 * m.duration))
                 start = min(lead, m.duration - seg - 0.5)
             cmd += loop + ["-ss", f"{start:.2f}", "-t", f"{seg + 0.5:.3f}", "-i", str(m.path)]
             chains.append(f"[{k}:v]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},"
