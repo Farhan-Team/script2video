@@ -391,7 +391,10 @@ JUNK_RE = re.compile(r"\b(lecture|interview|talk|talks|speech|conference|present
                      r"intro|title|titles|credits|logo|logos|map|maps|diagram|chart|graph|infographic|"
                      r"animation|animated|simulation|screencast|screenshot|slideshow|slides|episode|"
                      r"documentary|wikipedia|wikimedia|commons|lesson|course|class|meeting|hearing|"
-                     r"visualization|visualisation|model|render|cgi|3d|game|gameplay)\b", re.I)
+                     r"visualization|visualisation|model|render|cgi|3d|game|gameplay|"
+                     r"body ?cam|bodycam|dashcam|dash cam|axon|cctv|surveillance|band|orchestra|concert|"
+                     r"choir|astronaut|nasa|iss|spacewalk|ceremony|parade|speaker|testimony|vlog|selfie|"
+                     r"timelapse of construction|unboxing|review)\b", re.I)
 
 
 class StockFinder:
@@ -870,7 +873,9 @@ def caption_font(text: str, cfg: Config) -> tuple[str, float]:
             out = subprocess.run(["fc-list", ":", "family"], capture_output=True, text=True).stdout
         except OSError:
             out = ""
-        for fam in ("Noto Nastaliq Urdu", "Jameel Noori Nastaleeq", "Noto Naskh Arabic", "DejaVu Sans"):
+        # DejaVu Sans renders Urdu reliably with every libass build; Nastaliq variable fonts can show
+        # empty boxes on some builds (seen on Colab), so they are only used if DejaVu is missing.
+        for fam in ("DejaVu Sans", "Noto Sans Arabic", "Noto Naskh Arabic", "Jameel Noori Nastaleeq"):
             if fam in out:
                 return fam, (0.85 if "Nastaliq" in fam or "Nastaleeq" in fam else 1.0)
     return cfg.font, 1.0
