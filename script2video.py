@@ -8,7 +8,8 @@ Pipeline
      falling back to your system's offline voice (pyttsx3).
   3. Stock footage per scene from Pexels / Pixabay videos, then Pexels /
      Pixabay / Unsplash photos (with a slow Ken Burns zoom), or your own
-     local footage folder.
+     local footage folder. With no API keys at all it uses Wikimedia Commons
+     videos and Openverse photos (free licenses, no key needed).
   4. Burned-in text overlay captions, timed to the narration.
   5. Everything joined with FFmpeg into one MP4 (+ optional background music).
 
@@ -280,15 +281,18 @@ class StockFinder:
             self.local = sorted(p for p in Path(cfg.media_dir).rglob("*")
                                 if p.suffix.lower() in VIDEO_EXT | IMAGE_EXT)
         self.warned: set[str] = set()
+        self.down: set[str] = set()
 
     # ---- provider searches (results cached on disk so re-runs cost no API calls)
     def _cached_get(self, provider: str, url: str, params: dict, headers: dict) -> Optional[dict]:
         f = self.cache / f"search_{provider}_{sha(url, json.dumps(params, sort_keys=True))}.json"
         if f.exists():
             return json.loads(f.read_text("utf-8"))
+        if provider in self.down:
+            return None
         for attempt in range(3):
             try:
-                r = self.http.get(url, params=params, headers=headers, timeout=30)
+                r = self.http.get(url, params=params, headers=headers, timeout=20)
                 if r.status_code == 429:
                     time.sleep(5 * (attempt + 1))
                     continue
@@ -303,8 +307,9 @@ class StockFinder:
                 return data
             except requests.RequestException as e:
                 if attempt == 2:
-                    log(f"  ! {provider} search failed: {e}")
-                time.sleep(2)
+                    self.down.add(provider)
+                    log(f"  ! {provider} unreachable ({type(e).__name__}) — skipping it for this run")
+                time.sleep(1)
         return None
 
     def pexels_videos(self, q: str) -> list[Media]:
@@ -392,6 +397,52 @@ class StockFinder:
                              ping=(p.get("links", {}) or {}).get("download_location", "")))
         return out
 
+    # ---- keyless sources (work with no API key at all)
+    def commons_videos(self, q: str) -> list[Media]:
+        """Wikimedia Commons free-licensed videos, using its 720p/1080p transcodes."""
+        d = self._cached_get("commons_v", "https://commons.wikimedia.org/w/api.php",
+                             {"action": "query", "format": "json", "generator": "search", "gsrnamespace": 6,
+                              "gsrsearch": f"{q} filetype:video", "gsrlimit": 25,
+                              "prop": "videoinfo", "viprop": "url|size|derivatives|extmetadata"}, {})
+        out = []
+        pages = ((d or {}).get("query") or {}).get("pages") or {}
+        for p in sorted(pages.values(), key=lambda p: p.get("index", 0)):
+            info = (p.get("videoinfo") or [{}])[0]
+            dur = float(info.get("duration") or 0)
+            if dur and dur < 3:
+                continue
+            ders = [x for x in info.get("derivatives", []) if x.get("src") and x.get("height")
+                    and "audio" not in (x.get("type") or "")]
+            target = min(self.cfg.width, self.cfg.height)
+            ders = [x for x in ders if 480 <= int(x["height"]) <= 1080] or ders
+            if not ders:
+                continue
+            best = min(ders, key=lambda x: abs(int(x["height"]) - target))
+            meta = info.get("extmetadata") or {}
+            artist = re.sub(r"<[^>]+>", "", (meta.get("Artist") or {}).get("value", "")).strip()[:80] or "Unknown"
+            lic = (meta.get("LicenseShortName") or {}).get("value", "")
+            out.append(Media("video", "commons", f"commons_{p.get('pageid')}", url=best["src"], duration=dur,
+                             credit=f"Video by {artist} ({lic}) via Wikimedia Commons",
+                             page=info.get("descriptionurl", "")))
+        return out
+
+    def openverse_photos(self, q: str) -> list[Media]:
+        """Openverse (WordPress) free-licensed photos — no key needed."""
+        d = self._cached_get("openverse", "https://api.openverse.org/v1/images/",
+                             {"q": q, "page_size": 20, "category": "photograph",
+                              "aspect_ratio": "tall" if self.cfg.height > self.cfg.width else "wide",
+                              "size": "large", "mature": "false"}, {})
+        out = []
+        for r in (d or {}).get("results", []):
+            if not r.get("url"):
+                continue
+            out.append(Media("image", "openverse", f"openverse_{r.get('id')}", url=r["url"],
+                             credit=f"Photo by {r.get('creator') or 'Unknown'} "
+                                    f"({(r.get('license') or '').upper()} {r.get('license_version') or ''}) "
+                                    f"via {r.get('source') or 'Openverse'}".replace("  ", " "),
+                             page=r.get("foreign_landing_url", "")))
+        return out
+
     def local_matches(self, q: str) -> list[Media]:
         words = [w for w in re.findall(r"[a-z0-9]+", q.lower()) if len(w) > 2]
         hits = [p for p in self.local if any(w in p.stem.lower() for w in words)]
@@ -404,12 +455,17 @@ class StockFinder:
 
     # ---- selection
     def pick(self, scene: Scene, n: int, seg: float) -> list[Media]:
+        has_keys = bool(self.cfg.pexels_key or self.cfg.pixabay_key or self.cfg.unsplash_key)
         if self.cfg.prefer == "photo":
             providers = [self.local_matches, self.pexels_photos, self.unsplash_photos, self.pixabay_photos,
-                         self.pexels_videos, self.pixabay_videos]
+                         self.openverse_photos, self.pexels_videos, self.pixabay_videos, self.commons_videos]
         else:
             providers = [self.local_matches, self.pexels_videos, self.pixabay_videos,
-                         self.pexels_photos, self.unsplash_photos, self.pixabay_photos]
+                         self.pexels_photos, self.unsplash_photos, self.pixabay_photos,
+                         self.commons_videos, self.openverse_photos]
+        if has_keys:  # keyless sources are only a fallback when keys exist
+            providers = [p for p in providers if p not in (self.commons_videos, self.openverse_photos)] + \
+                        [self.commons_videos, self.openverse_photos]
         chosen: list[Media] = []
         for q in scene.queries:
             for prov in providers:
@@ -638,8 +694,8 @@ def build_video(cfg: Config) -> Path:
     words = sum(len(s.text.split()) for s in scenes)
     log(f"• {len(scenes)} scenes, {words} words (≈{words / 150:.1f} min of narration)")
     if not (cfg.pexels_key or cfg.pixabay_key or cfg.unsplash_key or cfg.media_dir):
-        log("  ! No stock API keys and no --media-dir: visuals will be plain backgrounds. "
-            "Get free keys at pexels.com/api and pixabay.com/api/docs")
+        log("  • No API keys: using free keyless sources (Wikimedia Commons videos, Openverse photos). "
+            "For better footage add a free Pexels key (pexels.com/api)")
 
     # 1. voiceover
     cfg.progress(0.02, "Generating voiceover…")

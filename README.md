@@ -39,7 +39,7 @@ Videos are saved to `MyDrive/script2video/outputs`.
    ```
    pip install -r requirements.txt
    ```
-4. Get free API keys. Pexels alone is enough to start.
+4. *(Optional)* Get free API keys for better footage. **Without any key, the tool still works**: it uses free Wikimedia Commons videos and Openverse photos. Pexels alone is enough.
    - Pexels: https://www.pexels.com/api/
    - Pixabay: https://pixabay.com/api/docs/ (log in and your key is shown on the page)
    - Unsplash (optional, photos only): https://unsplash.com/developers
@@ -106,5 +106,5 @@ python script2video.py --help                                 # all options
   - Faster: `--size 1280x720` or `--workers 4`
   - Smaller file: `--crf 26`
 - **"edge-tts failed".** This needs internet. Run it again (finished voice parts are cached), or use the offline voice: `--tts system` (requires `pip install pyttsx3`).
-- **Plain blue backgrounds everywhere.** Your API keys are missing or wrong. Check `.env`.
+- **Footage doesn't match well.** Add a free Pexels key to `.env`, or add `[search: ...]` tags to your script.
 - **Captions in the wrong font.** Use `--font "Font Name"` with a font that's installed on your computer.
