@@ -644,7 +644,10 @@ class StockFinder:
                              page=info.get("descriptionurl", "")))
         return out
 
-    def commons_photos(self, q: str) -> list[Media]:
+    def commons_photos_relaxed(self, q: str) -> list[Media]:
+        return self.commons_photos(q, factor=0.5)
+
+    def commons_photos(self, q: str, factor: float = 0.8) -> list[Media]:
         """Wikimedia Commons free-licensed photos and historical images — huge, high-res, no key."""
         d = self._cached_get("commons_p", "https://commons.wikimedia.org/w/api.php",
                              {"action": "query", "format": "json", "generator": "search", "gsrnamespace": 6,
@@ -662,7 +665,7 @@ class StockFinder:
                 continue
             if JUNK_RE.search(title) or re.search(r"\b(coat of arms|flag|seal|signature|plan|icon)\b", title, re.I):
                 continue
-            if min(w, h) < need * 0.8:
+            if min(w, h) < need * factor:
                 continue                                                      # too small: blurry
             if (not portrait and h > w * 1.15) or (portrait and w > h * 1.15):
                 continue                                                      # wrong orientation
@@ -749,16 +752,17 @@ class StockFinder:
         chosen: list[Media] = []
         for k in range(n):
             own = scene.shot_queries[k] if k < len(scene.shot_queries) else []
-            queries = own + [q for q in scene.queries if q not in own]
+            if scene.shot_tags:   # the writer chose the subjects: never drift to loose keywords first
+                tags = own + [t for t in scene.shot_tags if t not in own]
+                queries = tags + [q for q in scene.queries if q not in tags]
+                passes = [(tags, providers), (tags, [self.commons_photos_relaxed, self.commons_videos_relaxed]),
+                          (queries, providers)]
+            else:
+                queries = own + [q for q in scene.queries if q not in own]
+                passes = [(queries, providers)]
             got = None
-            for q in queries:
-                for prov in providers:
-                    cands = [m for m in prov(q) if m.key not in self.used]
-                    # clips long enough to cover the shot without looping come first
-                    cands.sort(key=lambda m: 0 if (m.kind != "video" or m.duration >= seg) else 1)
-                    if cands:
-                        got = cands[0]
-                        break
+            for qs, provs in passes:
+                got = self._first(qs, provs, seg)
                 if got:
                     break
             if got is None:                          # last resort: softer (360p+) clips beat a blank shot
@@ -776,6 +780,16 @@ class StockFinder:
             self.used.add(got.key)
             chosen.append(got)
         return chosen
+
+    def _first(self, queries: list, providers: list, seg: float) -> Optional[Media]:
+        for q in queries:
+            for prov in providers:
+                cands = [m for m in prov(q) if m.key not in self.used]
+                # clips long enough to cover the shot without looping come first
+                cands.sort(key=lambda m: 0 if (m.kind != "video" or m.duration >= seg) else 1)
+                if cands:
+                    return cands[0]
+        return None
 
     def _fetch_segment(self, m: Media) -> bool:
         """Download only the part of a long remote video that the shot uses (HTTP range
